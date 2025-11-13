@@ -171,7 +171,7 @@ setup_toolchains() {
     # Clang 12
     if [ ! -d "$CLANG_DIR" ]; then
         info "Downloading Clang 12..."
-        git clone --depth=1 https://github.com/naifiprjkt/toolchains.git -b clang-12 "$CLANG_DIR" -q
+        git clone --depth=1 https://gitlab.com/RismaPwd/clang.git -b clang-15 "$CLANG_DIR" -q
     else
         info "Clang already exists, skipping download"
     fi
