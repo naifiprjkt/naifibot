@@ -1,11 +1,5 @@
 #!/usr/bin/env bash
 
-# ========================================
-# Azure Kernel Builder v2.0
-# Device: Samsung Galaxy A22 5G (A226B)
-# ========================================
-
-set -e
 BUILD_START=$(date +"%s")
 
 # ========================================
@@ -16,6 +10,7 @@ OUT_DIR="$SRC/out"
 KERNEL_IMG1="$OUT_DIR/arch/arm64/boot/Image"
 KERNEL_IMG="$OUT_DIR/arch/arm64/boot/Image.gz"
 RESULT_DIR="$SRC/result"
+BUILD_LOG="$OUT_DIR/build.log"
 
 # Device info
 DEVICE="A226B"
@@ -36,8 +31,11 @@ export KBUILD_BUILD_HOST="naifiprjkt"
 export USE_CCACHE=1
 
 # Create directories
-mkdir -p "$RESULT_DIR"
+mkdir -p "$RESULT_DIR" "$OUT_DIR"
 rm -rf "$RESULT_DIR"/*.zip
+
+# Create empty build log
+touch "$BUILD_LOG"
 
 # ========================================
 # COLOR VARIABLES
@@ -69,6 +67,78 @@ warning() {
 }
 
 # ========================================
+# SEND ERROR LOG TO TELEGRAM
+# ========================================
+send_error_log() {
+    error "Build failed! Sending error logs to Telegram..."
+    
+    if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+        warning "Telegram credentials not set (BOT_TOKEN or CHAT_ID missing)"
+        warning "Set them as environment variables to receive error notifications"
+        return 0
+    fi
+    
+    # Ensure log file exists
+    if [ ! -f "$BUILD_LOG" ]; then
+        warning "Build log not found, creating minimal log..."
+        echo "Build failed before log generation" > "$BUILD_LOG"
+        echo "Check workflow logs for details" >> "$BUILD_LOG"
+    fi
+    
+    # Extract errors (last 50 lines with errors)
+    local ERROR_LINES=$(grep -iE "error:|failed:|undefined reference|fatal:" "$BUILD_LOG" 2>/dev/null | tail -n 50 || echo "No specific errors found in log")
+    
+    # Escape HTML special characters
+    ERROR_LINES=$(echo "$ERROR_LINES" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+    
+    # Truncate if too long (Telegram limit: 1024 chars for caption)
+    if [ ${#ERROR_LINES} -gt 800 ]; then
+        ERROR_LINES="${ERROR_LINES:0:800}... (truncated, check full log)"
+    fi
+    
+    local MSG="<b>Build Failed!</b>
+
+<b>Device:</b> <code>$DEVICE</code>
+<b>Config:</b> <code>$DEFCONFIG</code>
+<b>Date:</b> <code>$DATE</code>
+
+<b>Error Summary:</b>
+<pre>$ERROR_LINES</pre>
+
+Full build log attached below"
+    
+    info "Uploading build log to Telegram..."
+    
+    # Send document with error log
+    local TG_RESPONSE=$(curl -sS -X POST \
+        "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
+        -F "chat_id=${CHAT_ID}" \
+        -F "document=@${BUILD_LOG}" \
+        -F "caption=${MSG}" \
+        -F "parse_mode=HTML" 2>&1)
+    
+    if echo "$TG_RESPONSE" | grep -q '"ok":true'; then
+        success "Error log successfully sent to Telegram!"
+    else
+        error "Failed to send error log to Telegram"
+        echo "Response: $TG_RESPONSE"
+    fi
+}
+
+# ========================================
+# ERROR TRAP HANDLER
+# ========================================
+error_handler() {
+    local exit_code=$?
+    error "Script failed with exit code: $exit_code"
+    send_error_log
+    exit $exit_code
+}
+
+# Set error trap
+trap error_handler ERR
+
+# ========================================
 # CHECK DEPENDENCIES
 # ========================================
 check_dependencies() {
@@ -85,6 +155,7 @@ check_dependencies() {
     
     if [ ${#missing[@]} -gt 0 ]; then
         error "Missing dependencies: ${missing[*]}"
+        send_error_log
         exit 1
     fi
     
@@ -101,18 +172,24 @@ setup_toolchains() {
     if [ ! -d "$CLANG_DIR" ]; then
         info "Downloading Clang 12..."
         git clone --depth=1 https://github.com/naifiprjkt/toolchains.git -b clang-12 "$CLANG_DIR" -q
+    else
+        info "Clang already exists, skipping download"
     fi
     
     # GCC Android 4.9
     if [ ! -d "$GCC_DIR" ]; then
         info "Downloading GCC Android 4.9..."
         git clone --depth=1 https://github.com/naifiprjkt/toolchains.git -b androidcc-4.9 "$GCC_DIR" -q
+    else
+        info "GCC already exists, skipping download"
     fi
     
     # ARM GNU
     if [ ! -d "$ARM_GNU_DIR" ]; then
         info "Downloading ARM GNU..."
         git clone --depth=1 https://github.com/naifiprjkt/toolchains.git -b arm-gnu "$ARM_GNU_DIR" -q
+    else
+        info "ARM GNU already exists, skipping download"
     fi
     
     # Export paths
@@ -132,41 +209,48 @@ clean_build() {
     info "Cleaning previous build..."
     rm -rf "$OUT_DIR"
     mkdir -p "$OUT_DIR"
+    touch "$BUILD_LOG"
     success "Clean complete!"
 }
 
 # ========================================
-# BUILD KERNEL (with better fail handling)
+# BUILD KERNEL
 # ========================================
 build_kernel() {
     info "Building kernel for $DEVICE..."
     info "Config: $DEFCONFIG"
     info "Threads: $(nproc)"
-
-    # pastikan log file ada dari awal
-    : > "$OUT_DIR/build.log"
-
+    
     # Generate defconfig
-    if ! make O="$OUT_DIR" ARCH="$ARCH" "$DEFCONFIG" -j$(nproc) 2>&1 | tee -a "$OUT_DIR/build.log"; then
+    info "Generating kernel configuration..."
+    if ! make O="$OUT_DIR" ARCH="$ARCH" "$DEFCONFIG" -j$(nproc) 2>&1 | tee "$BUILD_LOG"; then
         error "Failed to generate defconfig!"
         send_error_log
         exit 1
     fi
-
-    # Build
-    if ! make -j$(nproc) \
+    
+    # Build kernel
+    info "Compiling kernel (this may take a while)..."
+    set +e  # Temporarily disable exit on error
+    
+    make -j$(nproc) \
         O="$OUT_DIR" \
         ARCH="$ARCH" \
         CC="$CC" \
         CLANG_TRIPLE="$CLANG_TRIPLE" \
         CROSS_COMPILE="$CROSS_COMPILE" \
         CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
-        2>&1 | tee -a "$OUT_DIR/build.log"; then
-        error "Kernel compilation failed!"
+        2>&1 | tee -a "$BUILD_LOG"
+    
+    local BUILD_STATUS=${PIPESTATUS[0]}
+    set -e  # Re-enable exit on error
+    
+    if [ $BUILD_STATUS -ne 0 ]; then
+        error "Kernel compilation failed with exit code: $BUILD_STATUS"
         send_error_log
         exit 1
     fi
-
+    
     success "Kernel compiled successfully!"
 }
 
@@ -177,8 +261,10 @@ verify_build() {
     info "Verifying kernel image..."
     
     if [ ! -f "$KERNEL_IMG" ]; then
-        error "Image.gz not found!"
+        error "Image.gz not found at $KERNEL_IMG"
+        error "Build may have failed silently"
         ls -lah "$OUT_DIR/arch/arm64/boot/" 2>/dev/null || true
+        send_error_log
         exit 1
     fi
     
@@ -193,17 +279,11 @@ get_kernel_info() {
     info "Extracting kernel version..."
 
     if [ -f "$KERNEL_IMG1" ]; then
-        KERNEL_VERSION=$(strings "$KERNEL_IMG1" | grep "Linux version" || true)
-
-        if [ -z "$KERNEL_VERSION" ]; then
-            warning "Kernel version string not found in Image, marking as Unknown"
-            KERNEL_VERSION="Unknown"
-        fi
-
+        KERNEL_VERSION=$(strings "$KERNEL_IMG1" | grep -m1 "Linux version" || echo "Unknown")
         echo "Version: $KERNEL_VERSION"
     else
         KERNEL_VERSION="Unknown"
-        warning "Kernel image missing, cannot extract version"
+        warning "Kernel Image not found, version unknown"
     fi
 }
 
@@ -217,6 +297,7 @@ package_kernel() {
     
     # Clone AnyKernel3
     if [ ! -d "$AK_DIR" ]; then
+        info "Cloning AnyKernel3..."
         git clone --depth=1 https://github.com/naifiprjkt/AnyKernel3.git -b a22x "$AK_DIR" -q
     fi
     
@@ -240,7 +321,7 @@ package_kernel() {
 upload_to_gofile() {
     info "Uploading to GoFile..."
     
-    cd "$RESULT_DIR" || exit 1
+    cd "$RESULT_DIR" || return 1
     
     # Try multiple servers
     for server in store1 store2 store3 store4; do
@@ -267,61 +348,18 @@ upload_to_gofile() {
 }
 
 # ========================================
-# SEND ERROR LOG (improved & reliable)
-# ========================================
-send_error_log() {
-    error "Sending error logs to Telegram..."
-
-    if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
-        warning "Telegram credentials not set, skipping..."
-        return 0
-    fi
-
-    local LOG_FILE="$OUT_DIR/build.log"
-
-    # fallback kalau log gak ada
-    if [ ! -f "$LOG_FILE" ]; then
-        echo "[WARN] build.log not found, creating minimal log..."
-        echo "No build.log generated, possibly error before compilation." > "$OUT_DIR/build.log"
-    fi
-
-    # buat ringkasan error di caption
-    local ERROR_MSG
-    ERROR_MSG=$(grep -i "error" "$LOG_FILE" 2>/dev/null | tail -n 20 || echo "No errors found in log")
-
-    local MSG="<b>Build Failed!</b>
-
-<b>Device:</b> <code>$DEVICE</code>
-<b>Date:</b> <code>$DATE</code>
-
-<b>Last 20 errors:</b>
-<pre>${ERROR_MSG}</pre>"
-
-    # pastikan dikirim walau error kecil
-    curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
-        -F "chat_id=${CHAT_ID}" \
-        -F "document=@${LOG_FILE}" \
-        -F "caption=${MSG}" \
-        -F "parse_mode=HTML" >/dev/null 2>&1 || {
-            warning "Failed to send log to Telegram"
-        }
-
-    success "Error log sent to Telegram!"
-}
-
-# ========================================
 # SEND TELEGRAM NOTIFICATION
 # ========================================
 send_telegram_notification() {
     info "Sending notification to Telegram..."
     
     if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
-        warning "Telegram credentials not set, skipping..."
+        warning "Telegram credentials not set, skipping notification..."
         return 0
     fi
     
     if [ -z "$DOWNLOAD_LINK" ]; then
-        warning "No download link available"
+        warning "No download link available, skipping notification"
         return 0
     fi
     
@@ -378,6 +416,7 @@ main() {
         success "KernelSU setup complete!"
     else
         error "KernelSU setup failed!"
+        send_error_log
         exit 1
     fi
     
