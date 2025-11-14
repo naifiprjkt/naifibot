@@ -412,7 +412,7 @@ main() {
     
     # Setup KernelSU
     info "Setting up KernelSU..."
-    if curl -LSs "https://raw.githubusercontent.com/naifiprjkt/KernelSU-Next/next/kernel/setup.sh" | bash -s next; then
+    if curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next; then
         success "KernelSU setup complete!"
     else
         error "KernelSU setup failed!"
