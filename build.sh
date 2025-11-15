@@ -14,7 +14,7 @@ BUILD_LOG="$OUT_DIR/build.log"
 
 # Device info
 DEVICE="A226B"
-DEFCONFIG="azure_defconfig"
+DEFCONFIG="a22x_defconfig"
 ARCH="arm64"
 DATE="$(date +"%Y%m%d%H%M")"
 KERNEL_ZIP="${DEVICE}-KSU-${DATE}.zip"
